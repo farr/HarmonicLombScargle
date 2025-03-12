@@ -3,16 +3,19 @@ import numpy as np
 import pymc as pm
 import pytensor.tensor as pt
 
-def harmonic_sho_model(t, y, yerr, yquarters, f0, harmonics, mu_mu, mu_sigma, sho_sigma_prior, f_frac_uncert=0.1, psd_freq=None, predict_times=None):
+def harmonic_sho_model(t, y, yerr, yquarters, f0, f_frac_uncert, mu_mu, mu_sigma, sho_sigma_prior, psd_freq=None, predict_flux=False):
     """A (quasi)harmonic simple-harmonic-oscillator GP model for a time series.
 
     Produce a pymc model for the given time multi-quarter / multi-period time
-    series that represents it as a celerite GP with a sum of SHO terms.  The
-    frequencies of the SHO terms are encouranged by a prior to be harmonics of
-    the given fundamental frequency, as might be expected for the quasi-periodic
-    oscillations due to the rotation of a spotty star.  The model contains a
+    series that represents it as a celerite GP with a sum of two SHO terms
+    designed to find the fundamental and first harmonic of rotation (i.e. a
+    celerite `RotationTerm`).  The fundamnetal frequency is given a log-normal
+    prior centered at `f0` with width `f_frac_uncert`.  The model contains a
     per-quarter constant flux offset (i.e. per-quarter mean term) to account for
-    a varying zero-point period-by-period.
+    a varying zero-point period-by-period, as well as a red-noise, "real"
+    celerite term to account for additional variability not captured by the
+    SHOs.  The real term is also known as a "damped random walk," and its "knee"
+    frequency is constrained to be below the fundamental frequency of the SHOs.
 
     Parameters
     ----------
@@ -30,10 +33,8 @@ def harmonic_sho_model(t, y, yerr, yquarters, f0, harmonics, mu_mu, mu_sigma, sh
         A guess at the fundamental frequency of the oscillators (i.e. the
         inverse of the estimated rotation period).  Each harmonic will have a
         LogNormal prior for its frequency peaking at `i*f0` for harmonic `i`.
-    harmonics : int array_like
-        The harmonics to include in the model (the first element should be `1`,
-        followed by whatever multiples of the fundamental frequency are
-        desired).
+    f_frac_uncert : float
+        The standard deviation of the log-frequency prior for the harmonics.
     mu_mu : array_like
         The mean of the Normal prior applied to the per-period flux offsets.
     mu_sigma : float
@@ -45,24 +46,24 @@ def harmonic_sho_model(t, y, yerr, yquarters, f0, harmonics, mu_mu, mu_sigma, sh
         distribution peaking at this value and with a width that gives a prior
         two-sigma span that is a factor of 10 smaller to a factor of 10 larger
         than this value.
-    f_frac_uncert : float, default=0.1
-        The standard deviation of the log-frequency prior for the harmonics.
     psd_freq : array_like, optional
         If given, each sample will record the GP PSD at these frequencies (per
         cycle, not per radian).
-    predict_times : array_like, optional
+    predict_flux : bool, default=False
         If given, each sample will record the model's estimate of the expected
-        flux at these times.
+        flux at the observation times.
     """
     uquarters, quarter_indices = np.unique(yquarters, return_inverse=True)
 
-    nharmonics = len(harmonics)
+    T = np.max(t) - np.min(t)
+    fmin = 1/T
+    fmax = 1/(2*np.min(np.diff(t)))
 
-    coords = {'harmonics': harmonics, 'quarters': uquarters, 'times': t}
+    coords = {'quarters': uquarters}
     if psd_freq is not None:
         coords['frequencies'] = psd_freq
-    if predict_times is not None:
-        coords['predict_times'] = predict_times
+    if predict_flux:
+        coords['times'] = t
 
     with pm.Model(coords=coords) as model:
         nquarters = mu_mu.shape[0]
@@ -72,27 +73,33 @@ def harmonic_sho_model(t, y, yerr, yquarters, f0, harmonics, mu_mu, mu_sigma, sh
 
         y_centered = y - mus[quarter_indices]
 
-        log_fs_scaled = pm.Normal('log_fs_scaled', 0, 1, shape=(nharmonics,), dims=['harmonics'])
-        log_fs = pm.Deterministic('log_fs', log_fs_scaled*f_frac_uncert + pt.log(f0) + pt.log(harmonics), dims=['harmonics'])
-        fs = pm.Deterministic('fs', pt.exp(log_fs), dims=['harmonics'])
+        log_err_scale = pm.Uniform('log_err_scale', -np.log(2), np.log(2))
+        err_scale = pm.Deterministic('err_scale', pt.exp(log_err_scale))
 
-        log_Qs_scaled = pm.Normal('log_Qs_scaled', 0, 1, shape=(nharmonics,), dims=['harmonics'])
-        log_Qs = pm.Deterministic('log_Qs', log_Qs_scaled * pt.log(10)/3 + pt.log(10), dims=['harmonics']) # LogNormal prior, peaks at Q = 10, 3-sigma width is a factor of 10
-        Qs = pm.Deterministic('Qs', pt.exp(log_Qs), dims=['harmonics'])
+        log_period_scaled = pm.Normal('log_period_scaled', 0, 1)
+        log_period = pm.Deterministic('log_period', -pt.log(f0) + f_frac_uncert*log_period_scaled)
+        period = pm.Deterministic('period', pt.exp(log_period))
+        _ = pm.Deterministic('f0', 1/period)
 
-        log_sigma_scaled = pm.Normal('log_sigma_scaled', 0, 1, shape=(nharmonics,), dims=['harmonics'])
-        log_sigma = pm.Deterministic('log_sigma', pt.log(sho_sigma_prior) + pt.log(10)/2*log_sigma_scaled, dims=['harmonics'])
-        sigmas = pm.Deterministic('sigmas', pt.exp(log_sigma), dims=['harmonics'])
+        log_sigma_scaled = pm.Normal('log_sigma_scaled', 0, 1)
+        log_sigma = pm.Deterministic('log_sigma', pt.log(sho_sigma_prior) + pt.log(10)/2*log_sigma_scaled)
+        sigma = pm.Deterministic('sigma', pt.exp(log_sigma))
 
-        trms = [terms.SHOTerm(w0=2*np.pi*fs[i], Q=Qs[i], sigma=sigmas[i]) for i in range(nharmonics)]
-        kernel = terms.TermSum(*trms)
+        frac = pm.Uniform('frac', 0, 1)
+
+        dQ1 = pm.LogNormal('dQ1', pt.log(5), 1)
+        dQ0 = pm.LogNormal('dQb', pt.log(5), 1)
+        Q0 = pm.Deterministic('Q0', 0.5 + dQ1 + dQ0)
+        Q1 = pm.Deterministic('Q1', 0.5 + dQ1)
+
+        kernel = terms.RotationTerm(sigma=sigma, period=period, Q0=dQ1, dQ=dQ0, f=frac)
 
         gp = GaussianProcess(kernel)
-        gp.compute(t, yerr=yerr, quiet=True)
+        gp.compute(t, yerr=yerr*err_scale, quiet=True)
         pm.Potential('log_likelihood', gp.log_likelihood(y_centered))
 
-        if predict_times is not None:
-            pm.Deterministic('gp_mean_model', gp.predict(y_centered, t=predict_times, return_var=False) + mus[quarter_indices], dims=['predict_times'])
+        if predict_flux:
+            pm.Deterministic('gp_mean_model', gp.predict(y_centered, t=t, return_var=False) + mus[quarter_indices], dims=['times'])
 
         if psd_freq is not None:
             psd = gp.kernel.get_psd(2*np.pi*psd_freq)
