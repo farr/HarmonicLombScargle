@@ -69,7 +69,7 @@ def harmonic_sho_model(t, y, yerr, yquarters, f0, psd_freq=None, predict_flux=Fa
     # log_scale_factors_scaled is N(0,1)-ish.  Then N(0, 1/sqrt(n)) on
     # log_scale_factors produces a prior on log_scale_factors_scaled that is
     # N(0, 1/rel_std_quarters).
-    log_scale_factors_scaled = numpyro.sample('log_scale_factors_scaled', dist.Normal(0, 1/rel_std_quarters), sample_shape=nquarters)
+    log_scale_factors_scaled = numpyro.sample('log_scale_factors_scaled', dist.Normal(0, 1/rel_std_quarters), sample_shape=(nquarters,))
     log_scale_factors = rel_std_quarters / np.sqrt(n_in_quarters) * log_scale_factors_scaled
     scale_factors = numpyro.deterministic('scale_factors', jnp.exp(log_scale_factors))
 
