@@ -79,14 +79,6 @@ class HarmonicLombScargle(object):
 
         return np.array([self._best_fit_and_logl(f)[1] for f in pm(fs)])
     
-    def best_fit_power_estimate_on_grid(self, fs, progress=True):
-        if progress:
-            pm = tqdm
-        else:
-            pm = lambda x: x
-
-        return np.array([np.sum(np.square(self._best_fit_and_logl(f)[0][self.nquarters:])) for f in pm(fs)])
-    
     def interpolated_best_frequency(self, fs, logls):
         imax = np.argmax(logls)
         if imax == 0 or imax == len(fs) - 1:

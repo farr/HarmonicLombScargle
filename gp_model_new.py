@@ -1,8 +1,7 @@
-from celerite2.jax import terms, GaussianProcess
-import jax.numpy as jnp
+from celerite2.pymc import terms, GaussianProcess
 import numpy as np
-import numpyro
-import numpyro.distributions as dist
+import pymc as pm
+import pytensor.tensor as pt
 
 def harmonic_sho_model(t, y, yerr, yquarters, f0, psd_freq=None, predict_flux=False):
     """A (quasi)harmonic simple-harmonic-oscillator GP model for a time series.
@@ -60,94 +59,124 @@ def harmonic_sho_model(t, y, yerr, yquarters, f0, psd_freq=None, predict_flux=Fa
     if predict_flux:
         coords['times'] = t
 
-    nquarters = uquarters.shape[0]
+    with pm.Model(coords=coords) as model:
+        nquarters = uquarters.shape[0]
 
-    # Want a prior on the log_scale_factors that is N(0, 1/sqrt(n)) (very
-    # broad); expect a posterior that is N(0, rel_std_quarters / sqrt(n)).
-    # Let log_scale_factors = rel_std_quarters / sqrt(n) *
-    # log_scale_factors_scaled so that the posterior on
-    # log_scale_factors_scaled is N(0,1)-ish.  Then N(0, 1/sqrt(n)) on
-    # log_scale_factors produces a prior on log_scale_factors_scaled that is
-    # N(0, 1/rel_std_quarters).
-    log_scale_factors_scaled = numpyro.sample('log_scale_factors_scaled', dist.Normal(0, 1/rel_std_quarters))
-    log_scale_factors = rel_std_quarters / np.sqrt(n_in_quarters) * log_scale_factors_scaled
-    scale_factors = numpyro.deterministic('scale_factors', jnp.exp(log_scale_factors))
+        # Want a prior on the log_scale_factors that is N(0, 1/sqrt(n)) (very
+        # broad); expect a posterior that is N(0, rel_std_quarters / sqrt(n)).
+        # Let log_scale_factors = rel_std_quarters / sqrt(n) *
+        # log_scale_factors_scaled so that the posterior on
+        # log_scale_factors_scaled is N(0,1)-ish.  Then N(0, 1/sqrt(n)) on
+        # log_scale_factors produces a prior on log_scale_factors_scaled that is
+        # N(0, 1/rel_std_quarters).
+        log_scale_factors_scaled = pm.Normal('log_scale_factors_scaled', 0, 1/rel_std_quarters, shape=nquarters, dims=['quarters'])
+        log_scale_factors = rel_std_quarters / np.sqrt(n_in_quarters) * log_scale_factors_scaled
+        scale_factors = pm.Deterministic('scale_factors', pt.exp(log_scale_factors), dims=['quarters'])
 
-    # mus is the mean flux, and also the scaling factor for each quarter's
-    # GP.  That is, we are fitting flux = mus*(1+gp).
-    mus = numpyro.deterministic('mus', mu_quarters*scale_factors)
+        # mus is the mean flux, and also the scaling factor for each quarter's
+        # GP.  That is, we are fitting flux = mus*(1+gp).
+        mus = pm.Deterministic('mus', mu_quarters*scale_factors, dims=['quarters'])
 
-    y_scaled = y / mus[quarter_indices]
-    y_centered = y_scaled - 1.0
+        y_scaled = y / mus[quarter_indices]
+        y_centered = y_scaled - 1.0
 
-    y_err_scaled = yerr / mus[quarter_indices]
+        y_err_scaled = yerr / mus[quarter_indices]
 
-    # log_err_scale = pm.Uniform('log_err_scale', -np.log(2), np.log(2))
-    # err_scale = pm.Deterministic('err_scale', pt.exp(log_err_scale))
+        # log_err_scale = pm.Uniform('log_err_scale', -np.log(2), np.log(2))
+        # err_scale = pm.Deterministic('err_scale', pt.exp(log_err_scale))
 
-    # log_period_scaled = pm.Normal('log_period_scaled', 0, 1)
-    # log_period = pm.Deterministic('log_period', -pt.log(f0) + f_frac_uncert*log_period_scaled)
-    log_period = numpyro.sample('log_period', dist.Uniform(-jnp.log(f0) - np.log(np.sqrt(2)), -jnp.log(f0) + np.log(np.sqrt(2))))
-    period = numpyro.deterministic('period', jnp.exp(log_period))
-    _ = numpyro.deterministic('f0', 1/period)
+        # log_period_scaled = pm.Normal('log_period_scaled', 0, 1)
+        # log_period = pm.Deterministic('log_period', -pt.log(f0) + f_frac_uncert*log_period_scaled)
+        log_period = pm.Uniform('log_period', -pt.log(f0) - np.log(np.sqrt(2)), -pt.log(f0) + np.log(np.sqrt(2)))
+        period = pm.Deterministic('period', pt.exp(log_period))
+        _ = pm.Deterministic('f0', 1/period)
 
-    # We want to impose a very broad prior, HN(0.1) on the sigma parameter
-    # (i.e. up to 10% variability), but we expect a posterior that is
-    # ~rel_std_quarters wide, so we define sigma_scaled = sigma /
-    # np.median(rel_std_quarters) so that sigma_scaled is unit-scale
-    # posterior.  Then a HN(0.1) on sigma induces a HN(0.1 /
-    # np.median(rel_std_quarters)) prior on sigma_scaled.
-    sigma_scaled = numpyro.sample('sigma_scaled', dist.HalfNormal(0.1 / np.median(rel_std_quarters)))
-    sigma = numpyro.deterministic('sigma', sigma_scaled * np.median(rel_std_quarters))
+        # We want to impose a very broad prior, HN(0.1) on the sigma parameter
+        # (i.e. up to 10% variability), but we expect a posterior that is
+        # ~rel_std_quarters wide, so we define sigma_scaled = sigma /
+        # np.median(rel_std_quarters) so that sigma_scaled is unit-scale
+        # posterior.  Then a HN(0.1) on sigma induces a HN(0.1 /
+        # np.median(rel_std_quarters)) prior on sigma_scaled.
+        sigma_scaled = pm.HalfNormal('sigma_scaled', 0.1 / np.median(rel_std_quarters))
+        sigma = pm.Deterministic('sigma', sigma_scaled * np.median(rel_std_quarters))
 
-    # logfrac = pm.Uniform('logfrac', np.log(0.1), np.log(10))
-    # frac = pm.Deterministic('frac', pt.exp(logfrac))
-    frac = numpyro.sample('frac', dist.Uniform(0, 1))
+        # logfrac = pm.Uniform('logfrac', np.log(0.1), np.log(10))
+        # frac = pm.Deterministic('frac', pt.exp(logfrac))
+        frac = pm.Uniform('frac', 0, 1)
 
-    dQ1 = numpyro.sample('dQ1', dist.LogNormal(np.log(5), 1))
-    dQ0 = numpyro.sample('dQb', dist.LogNormal(np.log(5), 1))
-    Q0 = numpyro.deterministic('Q0', 0.5 + dQ1 + dQ0)
-    Q1 = numpyro.deterministic('Q1', 0.5 + dQ1)
+        dQ1 = pm.LogNormal('dQ1', pt.log(5), 1)
+        dQ0 = pm.LogNormal('dQb', pt.log(5), 1)
+        Q0 = pm.Deterministic('Q0', 0.5 + dQ1 + dQ0)
+        Q1 = pm.Deterministic('Q1', 0.5 + dQ1)
 
-    kernel1 = terms.RotationTerm(sigma=sigma, period=period, Q0=dQ1, dQ=dQ0, f=frac)
+        kernel1 = terms.RotationTerm(sigma=sigma, period=period, Q0=dQ1, dQ=dQ0, f=frac)
 
-    longest_period = 1.0 / (f0 / np.sqrt(2))  
-    
-    # For RealTerm: c parameter (decay rate) controls 1/c = characteristic timescale
-    # We want the longest allowed timescale to be the longest period, so c_max = 1/longest_period
-    # We set c_min = 1/T (where T is total observation time) to avoid very long timescales
-    T_obs = np.max(t) - np.min(t)  # Total observation time
-    c_min = 1.0 / T_obs  # Longest allowed timescale is the total observation time
-    c_max = 1.0 / longest_period  # Shortest allowed timescale is the longest rotation period
-    
-    # Use a log-uniform prior for c between these bounds
-    log_c = numpyro.sample('log_c', dist.Uniform(np.log(c_min), np.log(c_max)))
-    c = numpyro.deterministic('c', jnp.exp(log_c))
-    
-    # For the amplitude parameter 'a', we want sigma_red_noise to follow the same
-    # pattern as the main sigma parameter for the rotation kernel
-    sigma_red_noise_scaled = numpyro.sample('sigma_red_noise_scaled', dist.HalfNormal(0.1 / np.median(rel_std_quarters)))
-    sigma_red_noise = numpyro.deterministic('sigma_red_noise', sigma_red_noise_scaled * np.median(rel_std_quarters))
-    
-    # The variance of the red noise process is just 'a'
-    a_red_noise = numpyro.deterministic('a_red_noise', sigma_red_noise * sigma_red_noise)
+        longest_period = 1.0 / (f0 / np.sqrt(2))  
+        
+        # For RealTerm: c parameter (decay rate) controls 1/c = characteristic timescale
+        # We want the longest allowed timescale to be the longest period, so c_max = 1/longest_period
+        # We set c_min = 1/T (where T is total observation time) to avoid very long timescales
+        T_obs = np.max(t) - np.min(t)  # Total observation time
+        # c_min = 1.0 / T_obs  # Longest allowed timescale is the total observation time
+        # c_max = 1.0 / longest_period  # Shortest allowed timescale is the longest rotation period
+        
+        # # Use a log-uniform prior for c between these bounds
+        # log_c = pm.Uniform('log_c', pt.log(c_min), pt.log(c_max))
+        # c = pm.Deterministic('c', pt.exp(log_c))
 
-    kernel2 = terms.RealTerm(a=a_red_noise, c=c)
+        log_timescale = pm.Uniform('log_timescale', np.log(longest_period), np.log(T_obs))
+        timescale = pm.Deterministic('timescale', pt.exp(log_timescale))
+        c = pm.Deterministic('c', 1.0/timescale)
+        
+        # For the amplitude parameter 'a', we want sigma_red_noise to follow the same
+        # pattern as the main sigma parameter for the rotation kernel
+        sigma_red_noise_scaled = pm.HalfNormal('sigma_red_noise_scaled', 0.1 / np.median(rel_std_quarters))
+        sigma_red_noise = pm.Deterministic('sigma_red_noise', sigma_red_noise_scaled * np.median(rel_std_quarters))
+        
+        # kernel2 = terms.RealTerm(a=a_red_noise, c=c) We are approximating the
+        # RealTerm with a SHO term that is over-damped, Q << 0.5 The PSD for an
+        # SHO term is S(w) = sqrt(2/pi) S0 w0^4 / ((w^2 - w0^2)^2 + (w0/Q)^2
+        # w^2) A few facts about this expression: 
+        # 
+        # As w -> 0, S(w) -> sqrt(2/pi)S0. 
+        # 
+        # The RMS of the SHO term is sqrt(S0 w0 Q).
+        # 
+        # For small Q, the derivative S'(w) = -2*S(0) (w0*Q)^2/w^3 + O(Q^4)
+        # 
+        # We note that the equivalent derivative of the RealTerm (w S'(w)/S0) is
+        # -0.5 when w = c, the damping rate.
+        #
+        # Our approach here is to fix Q = 0.1 << 0.5 (so the oscillator is
+        # over-damped), and then match (1) the RMS we wanted from the RealTerm
+        # and (2) choose the SHR term's w0 to match w S'(w)/S0 at w = c.
+        #
+        # These two conditions give (2): w0 = 0.5 c / Q, and then (1) S0 = a/(w0*Q)
+        Q = 0.1
 
-    kernel = kernel1 + kernel2
+        # Chosen to match the RMS from `sigma_red_noise`
+        w0 = pm.Deterministic('w0', c / (2*Q))
+        S0 = pm.Deterministic('S0', sigma_red_noise * sigma_red_noise / (w0 * Q))
 
-    gp = GaussianProcess(kernel)
-    gp.compute(t, yerr=y_err_scaled, quiet=True)
+        
+        kernel2 = terms.SHOTerm(S0=S0, w0=w0, Q=Q)
 
-    # The GP will compute p(y_centered | parameters), but we need p(y |
-    # parameters), so require a log-Jacobian term that is
-    # log-det(d(y_centered)/dy), or -sum(log(mus))
-    numpyro.factor('log_likelihood', gp.log_likelihood(y_centered))
-    numpyro.factor('log_likelihood_jacobian', -pt.sum(pt.log(mus[quarter_indices])))
+        kernel = kernel1 + kernel2
 
-    if predict_flux:
-        numpyro.deterministic('gp_mean_model', mus[quarter_indices]*(1 + gp.predict(y_centered, t=t, return_var=False)))
+        gp = GaussianProcess(kernel)
+        gp.compute(t, yerr=y_err_scaled, quiet=True)
 
-    if psd_freq is not None:
-        psd = gp.kernel.get_psd(2*np.pi*psd_freq)
-        numpyro.deterministic('psd', psd*2*np.pi, dims=['frequencies']) # Convert from per-radian to per-cycle
+        # The GP will compute p(y_centered | parameters), but we need p(y |
+        # parameters), so require a log-Jacobian term that is
+        # log-det(d(y_centered)/dy), or -sum(log(mus))
+        pm.Potential('log_likelihood', gp.log_likelihood(y_centered))
+        pm.Potential('log_likelihood_jacobian', -pt.sum(pt.log(mus[quarter_indices])))
+
+        if predict_flux:
+            pm.Deterministic('gp_mean_model', mus[quarter_indices]*(1 + gp.predict(y_centered, t=t, return_var=False)), dims=['times'])
+
+        if psd_freq is not None:
+            psd = gp.kernel.get_psd(2*np.pi*psd_freq)
+            pm.Deterministic('psd', psd*2*np.pi, dims=['frequencies']) # Convert from per-radian to per-cycle 
+
+        return model
